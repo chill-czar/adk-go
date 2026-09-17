@@ -16,8 +16,10 @@
 package api
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -215,6 +217,27 @@ func (w *redirectRewriter) Flush() {
 // handler needs for SetWriteDeadline.
 func (w *redirectRewriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
+// Hijack lets /run_live take over the connection for its WebSocket upgrade.
+//
+// gorilla/websocket type-asserts the ResponseWriter to http.Hijacker directly
+// and does not consult Unwrap, so a wrapper that omits this method turns every
+// upgrade into a 500. Only the prefixed mount wraps the writer, which is why
+// the failure shows on the default /api path and not on an empty prefix.
+//
+// Anything else that wraps a ResponseWriter here has to forward this too.
+func (w *redirectRewriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		// Wrapping the sentinel keeps errors.Is(err, http.ErrNotSupported)
+		// true. http.ResponseController finds this method before it follows
+		// Unwrap, so without the wrap this type would silently change that
+		// answer from true to false for everything underneath it.
+		return nil, nil, fmt.Errorf("redirectRewriter: underlying %T is not an http.Hijacker: %w",
+			w.ResponseWriter, http.ErrNotSupported)
+	}
+	return h.Hijack()
+}
+
 // rewriteRedirects re-adds pathPrefix to a redirect written below the mount.
 //
 // The handler under a mount is served a path with the prefix stripped, so any
@@ -279,6 +302,8 @@ func (a *apiLauncher) SetupSubrouters(router *mux.Router, config *launcher.Confi
 		ArtifactService: config.ArtifactService,
 		SSEWriteTimeout: a.config.sseWriteTimeout,
 		PluginConfig:    config.PluginConfig,
+		Authenticator:   config.Authenticator,
+		Authorizer:      config.Authorizer,
 		Compaction:      config.Compaction,
 		DebugConfig: adkrest.DebugTelemetryConfig{
 			TraceCapacity: a.config.traceCapacity,
@@ -335,7 +360,7 @@ func NewLauncher() weblauncher.Sublauncher {
 	fs.StringVar(&config.pathPrefix, "path_prefix", "/api", "ADK REST API path prefix. Default is '/api'.")
 	fs.DurationVar(&config.sseWriteTimeout, "sse-write-timeout", 120*time.Second, "SSE server write timeout (i.e. '10s', '2m' - see time.ParseDuration for details) - for writing the SSE response after reading the headers & body")
 	fs.IntVar(&config.traceCapacity, "trace_capacity", 10000, "Maximum number of traces to keep in memory.")
-	fs.BoolVar(&config.includeDebugAPI, "include_debug_api", false, "The debug api endpoint will be included in the API if and only if the flag is set to true.")
+	fs.BoolVar(&config.includeDebugAPI, "include_debug_api", false, "The debug api endpoint will be included in the API if and only if the flag is set to true. !!! WARNING !!! : debug endpoints are not safe to be used in production environment, do not set them to true in production. ")
 
 	return &apiLauncher{
 		config: config,
